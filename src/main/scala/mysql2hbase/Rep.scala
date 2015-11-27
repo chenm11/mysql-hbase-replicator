@@ -1,9 +1,10 @@
 package mysql2hbase
 
 import java.lang.management.ManagementFactory
-import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import javax.management.ObjectName
+
+import org.apache.commons.logging.{LogFactory, Log}
 
 import scala.collection.mutable.Queue
 import scala.util.control.NonFatal
@@ -18,31 +19,36 @@ import scala.util.control.NonFatal
  * threshold, the replicator process will exit.
  */
 class Rep(config: Config) extends RepEvent.Listener {
-  private val hbaseApplier = new HbaseApplier(config.hbaseConfPath, config.hbaseBinlogTable, config.hbaseBinlogKey)
-
+  private val hbaseApplier = new HbaseApplier(config.hbaseConfPath,config.hbaseBinlogKey)
   private val failedEventQ = Queue[RepEvent.Event]()
   private val singleThreadE = Executors.newSingleThreadExecutor()
+  private val LOG: Log = LogFactory.getLog(classOf[Rep])
+  //val hbaseTableUtils = HBaseTableUtils
 
   val my = new MySQLExtractor(
     config.myHost, config.myPort, config.myServerId, config.myUsername, config.myPassword,
-    config.myDatabasesOnly, config.myTablesOnly,
     hbaseApplier.binlogGetPosition
   )
 
   //register mbean
   val mbeanServer = ManagementFactory.getPlatformMBeanServer
-  val hbaseApplierMbean = new ObjectName("com.cm:type=mysql2hbase.hbaseApplier");
-  val mySQLExtractorMbean = new ObjectName("com.cm:type=mysql2hbase.mySQLExtractor");
+  val hbaseApplierMbean = new ObjectName("com.cm:type=mysql2hbase.hbaseApplier")
+  val mySQLExtractorMbean = new ObjectName("com.cm:type=mysql2hbase.mySQLExtractor")
   mbeanServer.registerMBean(hbaseApplier,hbaseApplierMbean)
   mbeanServer.registerMBean(my,mySQLExtractorMbean)
-
   //init jmx
   val server = new HttpServer()
   val executor = Executors.newSingleThreadExecutor()
   executor.execute(server)
-
-
   my.addListener(this)
+  //sys.addShutdownHook(shutDownAndExit)
+  def shutDownAndExit()={
+    Log.info("shut down and exit")
+    executor.shutdownNow()
+    my.disconnectAndExit()
+    System.exit(0)
+  }
+
   my.connectKeepAlive()
 
   //--------------------------------------------------------------------------

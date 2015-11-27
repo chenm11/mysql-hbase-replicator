@@ -2,7 +2,6 @@ package mysql2hbase
 
 import java.io._
 
-
 import scala.collection.mutable.ArrayBuffer
 
 /**

@@ -2,9 +2,7 @@ package mysql2hbase
 
 import java.io.Serializable
 
-import com.github.shyiko.mysql.binlog.event.DeleteRowsEventData
-import com.github.shyiko.mysql.binlog.event.UpdateRowsEventData
-import com.github.shyiko.mysql.binlog.event.WriteRowsEventData
+import com.github.shyiko.mysql.binlog.event.{DeleteRowsEventData, UpdateRowsEventData, WriteRowsEventData}
 
 /** The events are serializable and may be played back later. */
 object RepEvent {

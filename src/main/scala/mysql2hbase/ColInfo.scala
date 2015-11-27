@@ -1,8 +1,8 @@
 package mysql2hbase
 
-import java.sql.Connection
-import java.sql.DriverManager
+import java.sql.{Connection, DriverManager}
 import java.util.BitSet
+
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 

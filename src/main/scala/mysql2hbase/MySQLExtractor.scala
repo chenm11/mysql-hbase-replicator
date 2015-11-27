@@ -2,71 +2,52 @@ package mysql2hbase
 
 
 import java.util.concurrent.atomic.AtomicLong
-
-import scala.util.control.NonFatal
-
 import com.github.shyiko.mysql.binlog.BinaryLogClient
-import com.github.shyiko.mysql.binlog.BinaryLogClient.EventListener
-import com.github.shyiko.mysql.binlog.BinaryLogClient.LifecycleListener
-import com.github.shyiko.mysql.binlog.event.DeleteRowsEventData
-import com.github.shyiko.mysql.binlog.event.Event
-import com.github.shyiko.mysql.binlog.event.EventData
-import com.github.shyiko.mysql.binlog.event.EventHeaderV4
-import com.github.shyiko.mysql.binlog.event.FormatDescriptionEventData
-import com.github.shyiko.mysql.binlog.event.RotateEventData
-import com.github.shyiko.mysql.binlog.event.TableMapEventData
-import com.github.shyiko.mysql.binlog.event.UpdateRowsEventData
-import com.github.shyiko.mysql.binlog.event.WriteRowsEventData
-
-// https://github.com/shyiko/rook/blob/master/rook-source-mysql/src/main/java/com/github/shyiko/rook/source/mysql/MySQLReplicationStream.java
-
+import com.github.shyiko.mysql.binlog.BinaryLogClient.{EventListener, LifecycleListener}
+import com.github.shyiko.mysql.binlog.event.{DeleteRowsEventData, Event, EventData, EventHeaderV4, FormatDescriptionEventData, RotateEventData, TableMapEventData, UpdateRowsEventData, WriteRowsEventData}
+import org.apache.log4j.Logger
+import scala.util.control.NonFatal
 object MySQLExtractor {
   private final val RECONNECT_DELAY_SECS = 5
 }
 
 /**
- * Error handling:
- *
- * When there's problem, it will be logged.
- *
- * If MySQLExtractor can't connect to MySQL, it will automatically retry every
- * 5 seconds.
- *
- * If MySQLExtractor can't connect to MySQL because the specified binlog file
- * name and position is too old, the replicator process will exit.
- *
- *
- */
-trait MySQLExtractorMBean{
-  def getTableEventCount():java.util.HashMap[String,AtomicLong]
+  * Error handling:
+  *
+  * When there's problem, it will be logged.
+  *
+  * If MySQLExtractor can't connect to MySQL, it will automatically retry every
+  * 5 seconds.
+  *
+  * If MySQLExtractor can't connect to MySQL because the specified binlog file
+  * name and position is too old, the replicator process will exit.
+  *
+  *
+  */
+trait MySQLExtractorMBean {
+  def getTableEventCount(): java.util.HashMap[String, AtomicLong]
 }
 
 
 class MySQLExtractor(
-  host: String, port: Int, serverId:Long, username: String, password: String,
-  dbonly: Seq[String],tableonly: Seq[String],  binlogFilename_Position: Option[(String, Long)])
-extends  MySQLExtractorMBean{
+                      host: String, port: Int, serverId: Long, username: String, password: String,
+                      binlogFilename_Position: Option[(String, Long)])
+  extends MySQLExtractorMBean {
 
   import MySQLExtractor._
-  var tableEventCount = new java.util.HashMap[String,AtomicLong]()
-  override def getTableEventCount():java.util.HashMap[String,AtomicLong]={tableEventCount}
-
 
   private val client = new BinaryLogClient(host, port, username, password)
+  var tableEventCount = new java.util.HashMap[String, AtomicLong]()
+  private var tablesById = Map[Long, TableInfo]()
   client.setServerId(serverId)
-
-
   binlogFilename_Position.foreach { case (f, p) =>
     client.setBinlogFilename(f)
     client.setBinlogPosition(p)
   }
-
   client.registerEventListener(new EventListener {
     override def onEvent(event: Event) {
       // client will automatically catch exception (if any) and log it out
-
-     // Log.trace(event.toString)
-
+      // Log.trace(event.toString)
       event.getData.asInstanceOf[EventData] match {
         case data: FormatDescriptionEventData =>
           onFormatDescription(data)
@@ -90,11 +71,12 @@ extends  MySQLExtractorMBean{
       }
     }
   })
+  //private var tablesByName = Map[String, TableInfo]()
+  private var listeners = Seq[RepEvent.Listener]()
 
-  // No need to sync tablesById because it's only modified within "onEvent"
-  // which should not be called concurrently
-  private var tablesById = Map[Long, TableInfo]()
-  private var listeners  = Seq[RepEvent.Listener]()
+  override def getTableEventCount(): java.util.HashMap[String, AtomicLong] = {
+    tableEventCount
+  }
 
   def addListener(listener: RepEvent.Listener) {
     synchronized {
@@ -104,7 +86,6 @@ extends  MySQLExtractorMBean{
 
   def connectKeepAlive() {
     // https://github.com/shyiko/mysql-binlog-connector-java/issues/37
-
     val lifecycleListener = new LifecycleListener() {
       private var shouldReconnect = true
 
@@ -177,9 +158,7 @@ extends  MySQLExtractorMBean{
     }.start()
   }
 
-  //--------------------------------------------------------------------------
-
-  private def onFormatDescription(data: FormatDescriptionEventData) {
+   private def onFormatDescription(data: FormatDescriptionEventData) {
     Log.info(
       "{}:{} server version: {}, binlog version: {}",
       host, port.toString,
@@ -199,39 +178,35 @@ extends  MySQLExtractorMBean{
     }
   }
 
-  private def onTableMap(data: TableMapEventData) {
-    val db = data.getDatabase
-    if (dbonly != null && !dbonly.contains(db)) return
 
+  private def onTableMap(data: TableMapEventData) {
+    //TODO: actions neended ,while table changes
+    val db = data.getDatabase
     val tableId = data.getTableId
     tablesById.get(tableId) match {
-      case None =>
+      case None => {
         val tableInfo = TableInfo.get(data, host, port, username, password)
         tablesById = tablesById.updated(tableId, tableInfo)
-
+      }
       case Some(existingTableInfo) =>
         if (!existingTableInfo.sameData(data)) {
+          val oldTableInfo = existingTableInfo
           val tableInfo = TableInfo.get(data, host, port, username, password)
+          //exit when pk change
+          if (oldTableInfo.isKeyColumnChanged(tableInfo)) {
+            throw new Exception("primary key columns changed in table : " + tableInfo.getDBTableName())
+          }
           tablesById = tablesById.updated(tableId, tableInfo)
         }
     }
   }
 
-  //--------------------------------------------------------------------------
 
   private def onInsert(header: EventHeaderV4, data: WriteRowsEventData) {
     val np = header.getNextPosition
     val id = data.getTableId
     val ti = tablesById.get(id)
-
-    val tableName = ti.get.getDBTableName()+".insert"
-    if(!tableEventCount.containsKey(tableName)){
-      tableEventCount.put(tableName,new AtomicLong)
-    }
-    tableEventCount.get(tableName).incrementAndGet()
-
-
-
+    countEvent(ti.get, "insert")
     if (doesDbNeedRep(ti, np)) synchronized {
       for (listener <- listeners) {
         listener.onEvent(new RepEvent.Insert(np, ti.get, data))
@@ -239,18 +214,32 @@ extends  MySQLExtractorMBean{
     }
   }
 
+  private def countEvent(tableInfo: TableInfo, event: String): Unit = {
+    val atype = tableInfo.getDBTableName() + "." + event
+    if (!tableEventCount.containsKey(atype)) {
+      tableEventCount.put(atype, new AtomicLong)
+    }
+    tableEventCount.get(atype).incrementAndGet()
+  }
+
+  private def doesDbNeedRep(tio: Option[TableInfo], nextPosition: Long): Boolean = {
+    if (HBaseTableUtils.isTableNeedReplicated(tio.get.data.getDatabase, tio.get.getDBTableName))
+      true
+    else{
+    synchronized {
+      for (listener <- listeners) {
+        listener.onEvent(new RepEvent.BinlogNextPosition(nextPosition))
+      }
+    }
+    false
+    }
+  }
+
   private def onUpdate(header: EventHeaderV4, data: UpdateRowsEventData) {
     val np = header.getNextPosition
     val id = data.getTableId
     val ti = tablesById.get(id)
-
-    val tableName = ti.get.getDBTableName()+".update"
-    if(!tableEventCount.containsKey(tableName)){
-      tableEventCount.put(tableName,new AtomicLong)
-    }
-    tableEventCount.get(tableName).incrementAndGet()
-
-
+    countEvent(ti.get, "update")
     if (doesDbNeedRep(ti, np)) synchronized {
       for (listener <- listeners) {
         listener.onEvent(new RepEvent.Update(np, ti.get, data))
@@ -262,29 +251,11 @@ extends  MySQLExtractorMBean{
     val np = header.getNextPosition
     val id = data.getTableId
     val ti = tablesById.get(id)
-
-    val tableName = ti.get.getDBTableName()+".delete"
-    if(!tableEventCount.containsKey(tableName)){
-      tableEventCount.put(tableName,new AtomicLong)
-    }
-    tableEventCount.get(tableName).incrementAndGet()
-
+    countEvent(ti.get, "delete")
     if (doesDbNeedRep(ti, np)) synchronized {
       for (listener <- listeners) {
         listener.onEvent(new RepEvent.Remove(np, ti.get, data))
       }
     }
-  }
-
-  /** Calls onBinlogNextPosition of the listeners if the DB doesn't need replication. */
-  private def doesDbNeedRep(tio: Option[TableInfo], nextPosition: Long): Boolean = {
-    if (tio.isDefined &&  (dbonly.isEmpty || (dbonly.contains(tio.get.data.getDatabase) && tableonly.contains(tio.get.getDBTableName()))))
-      return true
-    synchronized {
-      for (listener <- listeners) {
-        listener.onEvent(new RepEvent.BinlogNextPosition(nextPosition))
-      }
-    }
-    false
   }
 }

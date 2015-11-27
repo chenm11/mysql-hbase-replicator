@@ -1,171 +1,126 @@
 package mysql2hbase
 
 import java.io.Serializable
-import java.lang.management.ManagementFactory
 import java.util
 import java.util.BitSet
 import java.util.concurrent.atomic.AtomicLong
-
 import com.github.shyiko.mysql.binlog.event.{DeleteRowsEventData, UpdateRowsEventData, WriteRowsEventData}
 import org.apache.commons.lang3.time.StopWatch
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.hbase.{HColumnDescriptor, TableName, HTableDescriptor, HBaseConfiguration}
+import org.apache.hadoop.fs.Path
 import org.apache.hadoop.hbase.client._
 import org.apache.hadoop.hbase.util.Bytes
+import org.apache.hadoop.hbase.{HBaseConfiguration, HColumnDescriptor, HTableDescriptor, TableName}
 import org.apache.hadoop.security.UserGroupInformation
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.hbase.util.{DataTypeUtils, HBaseKVHelper}
+
 import scala.collection.JavaConverters._
-import org.apache.hadoop.fs.Path
 import scala.collection.mutable.ArrayBuffer
 
 
 trait HbaseApplierMBean {
   def getCount(): util.HashMap[String, AtomicLong]
 
-  def getDelay(): util.HashMap[String,  ArrayBuffer[Long]]
+  def getDelay(): util.HashMap[String, ArrayBuffer[Long]]
 
   def getBinlog(): String
 
   def getBinlogPosition(): Long
 
-}
-
-
-object HbaseApplier {
-  def login(hbaseConf: Configuration) = {
-    val krb = Config.getKrbLogin()
-    UserGroupInformation.setConfiguration(hbaseConf)
-    UserGroupInformation.loginUserFromKeytab(krb._1, krb._2)
-  }
-
+  final val INSERT="insert"
+  final val DELETE="delete"
+  final val UPDATE_INSERT="update.insert"
+  final val UPDATE_DELETE="update.delete"
 
   def initCount = {
     val count = new util.HashMap[String, AtomicLong]()
-    count.put("insert", new AtomicLong)
-    count.put("delete", new AtomicLong)
-    count.put("update.insert", new AtomicLong)
-    count.put("update.delete", new AtomicLong)
+    count.put(INSERT, new AtomicLong)
+    count.put(DELETE, new AtomicLong)
+    count.put(UPDATE_INSERT, new AtomicLong)
+    count.put(UPDATE_DELETE, new AtomicLong)
     count
   }
 
   def initDelay = {
     val delay = new util.HashMap[String, ArrayBuffer[Long]]()
-    delay.put("insert", ArrayBuffer[Long](0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-    delay.put("delete", ArrayBuffer[Long](0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-    delay.put("update.insert", ArrayBuffer[Long](0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-    delay.put("update.delete", ArrayBuffer[Long](0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+    delay.put(INSERT, ArrayBuffer[Long](0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+    delay.put(DELETE, ArrayBuffer[Long](0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+    delay.put(UPDATE_INSERT, ArrayBuffer[Long](0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+    delay.put(UPDATE_DELETE, ArrayBuffer[Long](0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
     delay
   }
-
 }
 
 
-class HbaseApplier(hbaseConfPath: Seq[String], hbaseBinlogTable: String, hbaseBinlogKey: String) extends HbaseApplierMBean {
-  var count = HbaseApplier.initCount
-  var delay = HbaseApplier.initDelay
+object HbaseApplier {
+  final val BINLOG_TABLE = "BinlogTable"
+  final val BINLOG__COLUMN_FAMILY = "cf"
+  final val BINLOG__FILENAME_COLUMN = "filename"
+  final val BINLOG__POSITION_COLUMN = "position"
+  val hbaseConf = HBaseConfiguration.create()
+  var hbaseAdmin = new HBaseAdmin(hbaseConf)
+  lazy val tables = collection.mutable.Map[String, HTable]()
+
+  HbaseApplier.login(hbaseConf)
+  def addConfPath(hbaseConfPath: Seq[String]) = {
+    hbaseConfPath.foreach { f => hbaseConf.addResource(new Path(f)) }
+    hbaseAdmin = new HBaseAdmin(hbaseConf)
+  }
+
+  def getTableForDatabase(dbTableName:String)={
+    HBaseTableUtils.getRelation(dbTableName) match {
+      case None =>
+        throw new Exception("meta table mapping not defined: " + dbTableName)
+      case Some(relation) => {
+        HbaseApplier.getTable(relation.hbaseTableName) match{
+          case None =>
+            throw new Exception("hbase data table not defined: " + dbTableName)
+          case Some(dataTable) => dataTable
+        }
+      }
+    }
+  }
+
+  def getTable(tableName: String):Option[HTable] = {
+    //not to create table automaticlly
+    tables.get(tableName) match{
+      case Some(table) => Some(table)
+      case None=>{
+        if (hbaseAdmin.tableExists(tableName)) {
+          None
+        }
+        val table =new HTable(hbaseConf, Bytes.toBytes(tableName))
+        table.setAutoFlushTo(false)
+        tables.put(tableName,table)
+        Some(table)
+      }
+    }
+  }
+
+  def login(hbaseConf: Configuration) = {
+    val krb = Config.getKrbLogin()
+    UserGroupInformation.setConfiguration(hbaseConf)
+    UserGroupInformation.loginUserFromKeytab(krb._1, krb._2)
+  }
+}
+
+
+class HbaseApplier(hbaseConfPath: Seq[String], hbaseBinlogKey: String) extends HbaseApplierMBean {
+  var count = initCount
+  var delay = initDelay
   var binlog: String = ""
   var binlogPosition: Long = 0L
-
+  HbaseApplier.addConfPath(hbaseConfPath)
+  val binlogTable = HbaseApplier.getTable(HbaseApplier.BINLOG_TABLE) match{
+    case None =>
+      throw new Exception("hbase meta table not defined: " + HbaseApplier.BINLOG_TABLE)
+    case Some(binlogTable) => binlogTable
+  }
   override def getCount = count
-
   override def getDelay = delay
-
   override def getBinlog = binlog
-
   override def getBinlogPosition = binlogPosition
-
-  val hbaseConf = HBaseConfiguration.create()
-  hbaseConfPath.foreach { f => hbaseConf.addResource(new Path(f)) }
-  HbaseApplier.login(hbaseConf)
-  val hbaseAdmin = new HBaseAdmin(hbaseConf)
-  val binlogTable = getTable(hbaseBinlogTable)
-
-
-  def getTable(tableName: String) = {
-    if (!hbaseAdmin.tableExists(tableName)) {
-      val htd = new HTableDescriptor(TableName.valueOf(tableName))
-      htd.addFamily(new HColumnDescriptor("cf"))
-      htd.addFamily(new HColumnDescriptor("pk"))
-      hbaseAdmin.createTable(htd)
-    }
-    new HTable(hbaseConf, Bytes.toBytes(tableName))
-  }
-
-  def binlogGetPosition: Option[(String, Long)] = {
-    val get = new Get(Bytes.toBytes(hbaseBinlogKey))
-    val result = binlogTable.get(get)
-    if (!result.isEmpty) {
-      val fn = result.getValue(Bytes.toBytes("cf"), Bytes.toBytes("filename"))
-      val pst = result.getValue(Bytes.toBytes("cf"), Bytes.toBytes("position"))
-      binlog = Bytes.toString(fn)
-      binlogPosition = Bytes.toLong(pst)
-      Log.info("read binglog {} {}", Bytes.toString(fn), Bytes.toLong(pst))
-      Option(Bytes.toString(fn), Bytes.toLong(pst))
-    } else {
-      None
-    }
-  }
-
-  def binlogRotate(filename: String, position: Long) {
-    //change to another filename position
-    val put = new Put(Bytes.toBytes(hbaseBinlogKey))
-    put.add(Bytes.toBytes("cf"), Bytes.toBytes("filename"), Bytes.toBytes(filename))
-    put.add(Bytes.toBytes("cf"), Bytes.toBytes("position"), Bytes.toBytes(position))
-    binlogTable.put(put)
-    binlog = filename
-    binlogPosition = position
-    Log.info("rotate to binglog {} {}", filename, position)
-  }
-
-  def binlogNextPosition(position: Long) {
-    //position =  new position
-    val put = new Put(Bytes.toBytes(hbaseBinlogKey))
-    put.add(Bytes.toBytes("cf"), Bytes.toBytes("position"), Bytes.toBytes(position))
-    binlogTable.put(put)
-    binlogPosition = position
-    Log.info("next binglog position {}", position)
-  }
-
-  def toScalaBitSet(s: BitSet): scala.collection.mutable.BitSet = {
-    new scala.collection.mutable.BitSet(s.toLongArray)
-  }
-
-
-  def getRowKey(includedColumns: BitSet, tableInfo: TableInfo, row: Array[Serializable]): Array[Byte] = {
-    val cols = tableInfo.cols
-    val pk = toScalaBitSet(tableInfo.primaryKey)
-    val included = toScalaBitSet(includedColumns)
-    if ((pk & included) == pk) {
-      //primary key must complete
-      var buffer = new ArrayBuffer[Serializable]
-      for (i <- 0 until cols.size) {
-        if (includedColumns.get(i) && tableInfo.primaryKey.get(i)) {
-          buffer.append(row(i))
-        }
-      }
-      SerializableUtil.serializableToBytes(buffer)
-    } else {
-      Array[Byte](0)
-    }
-  }
-
-  def getDelete(rowKey: Array[Byte]): Delete = {
-    new Delete(rowKey)
-  }
-
-  def getPut(rowKey: Array[Byte], includedColumns: java.util.BitSet, tableInfo: TableInfo, row: Array[Serializable]): Put = {
-    val put = new Put(rowKey)
-    val cols = tableInfo.cols
-    for (i <- 0 until cols.size) {
-      if (includedColumns.get(i)) {
-        if (tableInfo.primaryKey.get(i)) {
-          put.add(Bytes.toBytes("pk"), Bytes.toBytes(cols(i).name), SerializableUtil.serializableToBytes(row(i)))
-        } else {
-          put.add(Bytes.toBytes("cf"), Bytes.toBytes(cols(i).name), SerializableUtil.serializableToBytes(row(i)))
-        }
-      }
-    }
-    put
-  }
 
   def timedHbaseDataAction[A](actionType: String)(action: => Unit) = {
     val sw = new StopWatch
@@ -180,17 +135,107 @@ class HbaseApplier(hbaseConfPath: Seq[String], hbaseBinlogTable: String, hbaseBi
   }
 
 
+  def binlogGetPosition: Option[(String, Long)] = {
+    val get = new Get(Bytes.toBytes(hbaseBinlogKey))
+    val result = binlogTable.get(get)
+    if (!result.isEmpty) {
+      val fn = result.getValue(Bytes.toBytes(HbaseApplier.BINLOG__COLUMN_FAMILY),
+        Bytes.toBytes(HbaseApplier.BINLOG__FILENAME_COLUMN))
+      val pst = result.getValue(Bytes.toBytes(HbaseApplier.BINLOG__COLUMN_FAMILY),
+        Bytes.toBytes(HbaseApplier.BINLOG__POSITION_COLUMN))
+      binlog = Bytes.toString(fn)
+      binlogPosition = Bytes.toLong(pst)
+      Log.info("read binglog {} {}", Bytes.toString(fn), Bytes.toLong(pst))
+      Option(Bytes.toString(fn), Bytes.toLong(pst))
+    } else {
+      None
+    }
+  }
+
+  def binlogRotate(filename: String, position: Long) {
+    val put = new Put(Bytes.toBytes(hbaseBinlogKey))
+    put.add(Bytes.toBytes(HbaseApplier.BINLOG__COLUMN_FAMILY),
+      Bytes.toBytes(HbaseApplier.BINLOG__FILENAME_COLUMN), Bytes.toBytes(filename))
+    put.add(Bytes.toBytes(HbaseApplier.BINLOG__COLUMN_FAMILY),
+      Bytes.toBytes(HbaseApplier.BINLOG__POSITION_COLUMN), Bytes.toBytes(position))
+    binlogTable.put(put)
+    binlog = filename
+    binlogPosition = position
+    binlogTable.flushCommits()
+    Log.info("rotate to binglog {} {}", filename, position)
+  }
+
+  def binlogNextPosition(position: Long) {
+    val put = new Put(Bytes.toBytes(hbaseBinlogKey))
+    put.add(Bytes.toBytes(HbaseApplier.BINLOG__COLUMN_FAMILY),
+      Bytes.toBytes(HbaseApplier.BINLOG__POSITION_COLUMN), Bytes.toBytes(position))
+    binlogTable.put(put)
+    binlogPosition = position
+    binlogTable.flushCommits()
+    Log.info("next binglog position {}", position)
+  }
+
+  def toScalaBitSet(s: BitSet): scala.collection.mutable.BitSet = {
+    new scala.collection.mutable.BitSet(s.toLongArray)
+  }
+
+  def getPutForSpark(rowKey: Array[Byte], includedColumns: java.util.BitSet,
+                     tableInfo: TableInfo, row: Array[Serializable]): Put = {
+    val put = new Put(rowKey)
+    val relation = HBaseTableUtils.getRelation(tableInfo.getDBTableName()).get
+    val theSparkRow = Row.fromSeq(row)
+    relation.getNonKeyColumns().foreach(
+      nkc => {
+        val rowVal = DataTypeUtils.getRowColumnInHBaseRawType(
+          theSparkRow, nkc.ordinal, nkc.dataType, relation.getBytesUtils())
+        put.add(nkc.familyRaw, nkc.qualifierRaw, rowVal)
+      }
+    )
+    put
+  }
+
+  def getRowKeyForSpark(includedColumns: BitSet,
+                        tableInfo: TableInfo,
+                        row: Array[Serializable]): Array[Byte] = {
+    val cols = tableInfo.cols
+    val pk = toScalaBitSet(tableInfo.primaryKey)
+    val included = toScalaBitSet(includedColumns)
+    HBaseTableUtils.getRelation(tableInfo.getDBTableName()) match {
+      case None => throw new Exception("can't get table for " + tableInfo.getDBTableName())
+      case Some(relation) => {
+        if ((pk & included) != pk) {
+          throw new Exception("sql statement does not contain all primary keys")
+        }
+        val theSparkRow = Row.fromSeq(row)
+        val rawKeyCol = relation.getKeyColumns().map(
+          kc => {
+            val rowColumn = DataTypeUtils.getRowColumnInHBaseRawType(
+              theSparkRow, kc.ordinal, kc.dataType)
+            (rowColumn, kc.dataType)
+          }
+        )
+        HBaseKVHelper.encodingRawKeyColumns(rawKeyCol)
+      }
+    }
+  }
+
+  def getDelete(rowKey: Array[Byte]): Delete = {
+    new Delete(rowKey)
+  }
+
   def insert(nextPosition: Long, tableInfo: TableInfo, data: WriteRowsEventData) {
-    val table = getTable(tableInfo.getHTableName())
+    val table =
+      HbaseApplier.getTableForDatabase(tableInfo.getDBTableName())
     for (mySQLValues <- data.getRows.asScala) {
-      val rowKey = getRowKey(data.getIncludedColumns, tableInfo, mySQLValues)
+      val rowKey = getRowKeyForSpark(data.getIncludedColumns, tableInfo, mySQLValues)
       if (rowKey.length == 0) {
         Log.error("row key is null {}")
       }
-      val put = getPut(rowKey, data.getIncludedColumns, tableInfo, mySQLValues)
-      timedHbaseDataAction("insert")(table.put(put))
+      val put = getPutForSpark(rowKey, data.getIncludedColumns, tableInfo, mySQLValues)
+      timedHbaseDataAction(INSERT)(table.put(put))
     }
-    Log.info("insert {} log position {}", data.toString, nextPosition)
+    table.flushCommits()
+    Log.info("insert to  values  {} log position {}", data.toString, nextPosition)
     binlogNextPosition(nextPosition)
   }
 
@@ -199,31 +244,32 @@ class HbaseApplier(hbaseConfPath: Seq[String], hbaseBinlogTable: String, hbaseBi
   }
 
   def update(nextPosition: Long, tableInfo: TableInfo, data: UpdateRowsEventData) {
-    val table = getTable(tableInfo.getHTableName())
-    val watch = new StopWatch()
+    val table =
+      HbaseApplier.getTableForDatabase(tableInfo.getDBTableName())
     for (entry <- data.getRows.asScala) {
-      val rowKeyBefore = getRowKey(data.getIncludedColumnsBeforeUpdate, tableInfo, entry.getKey)
-      val rowKeyAfter = getRowKey(data.getIncludedColumns, tableInfo, entry.getValue)
-      Log.info("match row key is {}", isSameRowKey(rowKeyBefore, rowKeyAfter))
+      val rowKeyBefore = getRowKeyForSpark(data.getIncludedColumnsBeforeUpdate, tableInfo, entry.getKey)
+      val rowKeyAfter = getRowKeyForSpark(data.getIncludedColumns, tableInfo, entry.getValue)
       if (isSameRowKey(rowKeyBefore, rowKeyAfter)) {
         val del = getDelete(rowKeyBefore)
-        timedHbaseDataAction("update.delete")(table.delete(del))
+        timedHbaseDataAction(UPDATE_DELETE)(table.delete(del))
       }
-      val put = getPut(rowKeyAfter, data.getIncludedColumns, tableInfo, entry.getValue)
-      timedHbaseDataAction("update.insert")(table.put(put))
+      val put = getPutForSpark(rowKeyAfter, data.getIncludedColumns, tableInfo, entry.getValue)
+      timedHbaseDataAction(UPDATE_INSERT)(table.put(put))
     }
+    table.flushCommits()
     Log.info("update {} log position {}", data.toString, nextPosition)
     binlogNextPosition(nextPosition)
   }
 
   def remove(nextPosition: Long, tableInfo: TableInfo, data: DeleteRowsEventData) {
-    val table = getTable(tableInfo.getHTableName())
-    val watch = new StopWatch()
+    val table =
+      HbaseApplier.getTableForDatabase(tableInfo.getDBTableName())
     for (mySQLValues <- data.getRows.asScala) {
-      val rowKey = getRowKey(data.getIncludedColumns, tableInfo, mySQLValues)
+      val rowKey = getRowKeyForSpark(data.getIncludedColumns, tableInfo, mySQLValues)
       val del = getDelete(rowKey)
-      timedHbaseDataAction("delete")(table.delete(del))
+      timedHbaseDataAction(DELETE)(table.delete(del))
     }
+    table.flushCommits()
     Log.info("remove {} log position {}", data.toString, nextPosition)
     binlogNextPosition(nextPosition)
   }

@@ -6,10 +6,12 @@ object Main {
   def main(args: Array[String]) {
     // mysql-binlog-connector-java logs to JUL
     // http://www.slf4j.org/legacy.html#jul-to-slf4j
-    SLF4JBridgeHandler.removeHandlersForRootLogger()
-    SLF4JBridgeHandler.install()
-
+   // SLF4JBridgeHandler.removeHandlersForRootLogger()
+    //SLF4JBridgeHandler.install()
     val config = Config.load()
-    new Rep(config)
+    try {
+      new Rep(config)
+    }finally{
+    }
   }
 }

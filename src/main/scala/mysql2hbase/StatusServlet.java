@@ -3,6 +3,7 @@ package mysql2hbase;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import scala.collection.mutable.ArrayBuffer;
+
 import javax.management.*;
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServlet;

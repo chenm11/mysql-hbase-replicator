@@ -4,19 +4,10 @@ import java.io.Serializable
 import java.math.BigDecimal
 import java.util.BitSet
 
+import com.github.shyiko.mysql.binlog.event.{DeleteRowsEventData, UpdateRowsEventData, WriteRowsEventData}
+import com.mongodb.{BasicDBObject, DBObject, DuplicateKeyException, MongoClient, MongoClientURI, ReadPreference, WriteConcern}
+
 import scala.collection.JavaConverters._
-
-import com.github.shyiko.mysql.binlog.event.DeleteRowsEventData
-import com.github.shyiko.mysql.binlog.event.UpdateRowsEventData
-import com.github.shyiko.mysql.binlog.event.WriteRowsEventData
-
-import com.mongodb.BasicDBObject
-import com.mongodb.DBObject
-import com.mongodb.DuplicateKeyException
-import com.mongodb.MongoClient
-import com.mongodb.MongoClientURI
-import com.mongodb.ReadPreference
-import com.mongodb.WriteConcern
 
 /**
  * All writes are done with WriteConcern.ACKNOWLEDGED.
@@ -24,6 +15,7 @@ import com.mongodb.WriteConcern
  * Binlog position will be written as:
  * <code>{filename: "mysql-bin-changelog.002301", position: NumberLong(4)}</code>
  */
+@deprecated
 class MongoDBApplier(uri: String, binlogDb: String, binlogCollName: String, enumToString: Boolean) {
   private val client     = new MongoClient(new MongoClientURI(uri))
   private val binlogColl = client.getDB(binlogDb).getCollection(binlogCollName)

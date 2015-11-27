@@ -1,12 +1,17 @@
 organization := "cm"
 name         := "mysql2hbase"
-version      := "1.7-SNAPSHOT"
+version      := "1.1-with-hbase-spark"
 
-scalaVersion := "2.11.6"
+scalaVersion := "2.10.4"
 
 scalacOptions ++= Seq("-deprecation", "-feature", "-unchecked")
-javacOptions  ++= Seq("-source", "1.6", "-target", "1.6")
+javacOptions  ++= Seq("-source", "1.7", "-target", "1.7")
 
+//enablePlugins(SbtBackup)
+
+//backupHostname := "132.121.130.18"
+//
+//backupUsername := "root"
 //------------------------------------------------------------------------------
 
 // jul-to-slf4j: mysql-binlog-connector-java logs to JUL
@@ -39,16 +44,27 @@ libraryDependencies += "com.esotericsoftware.kryo" % "kryo" % "2.24.0"
 
 libraryDependencies += "org.eclipse.jetty"  %  "jetty-webapp"  %  "7.6.3.v20120416"
 
+libraryDependencies += "org.apache.spark"  %  "spark-core_2.10"  %  "1.4.0"
 
-//EclipseKeys.withSource := true
+libraryDependencies +=  "net.liftweb" % "lift-json_2.10" % "2.6.2"
+
+libraryDependencies +=  "jline" % "jline" % "0.9.94"
 
 // Put config directory in classpath for easier development --------------------
 
 // For "sbt console"
-unmanagedClasspath in Compile <+= (baseDirectory) map { bd => Attributed.blank(bd / "config") }
+unmanagedClasspath in Compile <+= (baseDirectory) map
+  { bd => Attributed.blank(bd / "config") }
 
 // For "sbt run"
-unmanagedClasspath in Runtime <+= (baseDirectory) map { bd => Attributed.blank(bd / "config") }
+unmanagedClasspath in Runtime <+= (baseDirectory) map
+  { bd => Attributed.blank(bd / "config") }
 
 // Copy these to target/xitrum when sbt xitrum-package is run
 XitrumPackage.copy("config", "script")
+
+
+
+//backupHostname := "132.121.130.18"
+
+//backupPort:=22
